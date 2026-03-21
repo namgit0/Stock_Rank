@@ -10,38 +10,10 @@ Run:
     python test_script.py
 """
 
-import yfinance as yf
 import pandas as pd
 import requests
+import time
 from datetime import datetime, timedelta
-
-# ─────────────────────────────────────────────
-# YAHOO FINANCE SESSION FIX
-# GitHub Actions IPs are blocked by Yahoo Finance by default.
-# This creates a session with proper headers and fetches a consent
-# cookie first so that yfinance requests are not blocked.
-# ─────────────────────────────────────────────
-def _create_yf_session() -> requests.Session:
-    session = requests.Session()
-    session.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0.0.0 Safari/537.36"
-        ),
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.5",
-        "Accept-Encoding": "gzip, deflate, br",
-        "Connection": "keep-alive",
-    })
-    try:
-        # Fetch Yahoo Finance homepage first to get session cookies
-        session.get("https://fc.yahoo.com", timeout=10)
-        session.get("https://finance.yahoo.com", timeout=10)
-        print("Yahoo Finance session initialised successfully.")
-    except Exception as e:
-        print(f"Warning: Could not initialise Yahoo Finance session: {e}")
-    return session
 
 # ─────────────────────────────────────────────
 # SETTINGS
@@ -194,17 +166,91 @@ def get_week_ranges(num_weeks: int) -> list:
 # ─────────────────────────────────────────────
 # DATA FETCHING
 # ─────────────────────────────────────────────
+def _yahoo_session() -> requests.Session:
+    """Create a requests session that mimics a browser to avoid Yahoo blocks."""
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+    })
+    try:
+        session.get("https://finance.yahoo.com", timeout=10)
+    except Exception:
+        pass
+    return session
+
+
+def _fetch_yahoo_history(ticker: str, start: str, end: str, session: requests.Session) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV data from Yahoo Finance v8 API directly.
+    Returns a DataFrame with columns: Open, High, Low, Close, Volume
+    indexed by date string (YYYY-MM-DD).
+    """
+    start_ts = int(datetime.strptime(start, "%Y-%m-%d").timestamp())
+    end_ts   = int(datetime.strptime(end,   "%Y-%m-%d").timestamp()) + 86400
+
+    url = (
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
+        f"?period1={start_ts}&period2={end_ts}&interval=1d&events=history"
+    )
+
+    for attempt in range(3):
+        try:
+            resp = session.get(url, timeout=20)
+            if resp.status_code == 429:
+                time.sleep(5 * (attempt + 1))
+                continue
+            if resp.status_code != 200:
+                return pd.DataFrame()
+            data = resp.json()
+            result = data.get("chart", {}).get("result", [])
+            if not result:
+                return pd.DataFrame()
+
+            r         = result[0]
+            timestamps = r.get("timestamp", [])
+            quote      = r["indicators"]["quote"][0]
+            adjclose   = r["indicators"].get("adjclose", [{}])[0].get("adjclose", quote["close"])
+
+            rows = []
+            for i, ts in enumerate(timestamps):
+                try:
+                    rows.append({
+                        "Date":   datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d"),
+                        "Open":   quote["open"][i],
+                        "High":   quote["high"][i],
+                        "Low":    quote["low"][i],
+                        "Close":  adjclose[i],
+                        "Volume": quote["volume"][i],
+                    })
+                except (IndexError, TypeError):
+                    continue
+
+            if not rows:
+                return pd.DataFrame()
+
+            df = pd.DataFrame(rows).dropna(subset=["Close"])
+            df = df.set_index("Date")
+            return df
+
+        except Exception:
+            time.sleep(2)
+
+    return pd.DataFrame()
+
+
 def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
     """
-    Bulk-download all tickers for the full date range, then slice into weeks.
-    Much faster than one request per ticker per week.
+    Download price data for all tickers using Yahoo Finance v8 API directly,
+    then slice into weekly buckets.
     """
-    # FIX #4: Require at least 2 tickers so yf.download always returns a
-    # MultiIndex DataFrame and the raw[ticker] access path is always used.
     if len(tickers) < 2:
-        raise ValueError(
-            f"Expected at least 2 tickers for consistent yf.download behaviour, got {len(tickers)}."
-        )
+        raise ValueError(f"Expected at least 2 tickers, got {len(tickers)}.")
 
     overall_start = weeks[0][0]
     overall_end   = (datetime.strptime(weeks[-1][1], "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
@@ -213,33 +259,42 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
     print(f"Date range: {overall_start} to {weeks[-1][1]}")
     print("This may take a few minutes...\n")
 
-    # Fetch shares outstanding once per ticker to compute historical market cap.
-    # Uses fast_info which is a lightweight call (no full info dict needed).
-    print("Fetching shares outstanding for each ticker (for historical market cap)...")
-    shares_outstanding = {}
+    session = _yahoo_session()
+
+    # Download all tickers
+    all_data = {}
+    failed = []
     for i, ticker in enumerate(tickers, 1):
+        df = _fetch_yahoo_history(ticker, overall_start, overall_end, session)
+        if df.empty:
+            failed.append(ticker)
+        else:
+            all_data[ticker] = df
+        if i % 50 == 0:
+            print(f"  {i}/{len(tickers)} tickers fetched ({len(all_data)} succeeded)...")
+        # Small delay to avoid rate limiting
+        time.sleep(0.05)
+
+    print(f"\n  {len(all_data)} tickers downloaded successfully ({len(failed)} failed).\n")
+
+    # Fetch shares outstanding
+    print("Fetching shares outstanding...")
+    shares_outstanding = {}
+    for i, ticker in enumerate(all_data.keys(), 1):
         try:
-            shares = getattr(yf.Ticker(ticker, session=session).fast_info, "shares", None)
-            if shares:
-                shares_outstanding[ticker] = shares
+            url = f"https://query1.finance.yahoo.com/v8/finance/chart/{ticker}?period1=0&period2=9999999999&interval=3mo&events=history"
+            resp = session.get(url, timeout=15)
+            if resp.status_code == 200:
+                data = resp.json()
+                meta = data.get("chart", {}).get("result", [{}])[0].get("meta", {})
+                shares = meta.get("sharesOutstanding")
+                if shares:
+                    shares_outstanding[ticker] = shares
         except Exception:
             pass
-        if i % 50 == 0:
-            print(f"  {i}/{len(tickers)} done...")
+        if i % 100 == 0:
+            print(f"  {i} done...")
     print(f"  Shares outstanding fetched for {len(shares_outstanding)} tickers.\n")
-
-    session = _create_yf_session()
-    raw = yf.download(
-        tickers,
-        start=overall_start,
-        end=overall_end,
-        interval="1d",
-        group_by="ticker",
-        auto_adjust=True,
-        progress=True,
-        threads=True,
-        session=session,
-    )
 
     results = []
 
@@ -247,18 +302,18 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
         label = f"{w_start} to {w_end}"
         print(f"  Processing week {week_idx:>2}/{len(weeks)}: {label}")
 
-        # FIX #1: Use >= 2 guard (clearer intent) and access by explicit index.
         if week_idx >= 2:
             prev_start, prev_end = weeks[week_idx - 2]
         else:
             prev_start, prev_end = None, None
 
         for ticker in tickers:
+            if ticker not in all_data:
+                continue
             try:
-                # FIX #4: Always use raw[ticker] now that single-ticker edge
-                # case is guarded at the top of this function.
-                df      = raw[ticker].loc[w_start:w_end]
-                df_prev = raw[ticker].loc[prev_start:prev_end] if prev_start else None
+                full_df = all_data[ticker]
+                df      = full_df.loc[w_start:w_end]
+                df_prev = full_df.loc[prev_start:prev_end] if prev_start else None
 
                 df = df.dropna(how="all")
                 if df.empty:
@@ -270,14 +325,12 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
                 week_low   = float(df["Low"].min())
                 week_vol   = int(df["Volume"].sum())
 
-                # % Change = close this week vs close of previous week (close-to-close)
                 if df_prev is not None and not df_prev.dropna(how="all").empty:
                     prev_close = float(df_prev.dropna(how="all")["Close"].iloc[-1])
                     pct_change = ((week_close - prev_close) / prev_close) * 100
                 else:
-                    pct_change = None  # first week has no prior close
+                    pct_change = None
 
-                # Historical market cap = close price × shares outstanding (in billions)
                 shares = shares_outstanding.get(ticker)
                 hist_mc = round(week_close * shares / 1e9, 2) if shares else None
 
@@ -300,9 +353,6 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
     return pd.DataFrame(results)
 
 
-# ─────────────────────────────────────────────
-# POST-PROCESSING
-# ─────────────────────────────────────────────
 def add_next_week_change(df: pd.DataFrame) -> pd.DataFrame:
     """
     Adds forward-looking columns, all relative to the current week's Close:
