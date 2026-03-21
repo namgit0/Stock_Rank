@@ -16,6 +16,34 @@ import requests
 from datetime import datetime, timedelta
 
 # ─────────────────────────────────────────────
+# YAHOO FINANCE SESSION FIX
+# GitHub Actions IPs are blocked by Yahoo Finance by default.
+# This creates a session with proper headers and fetches a consent
+# cookie first so that yfinance requests are not blocked.
+# ─────────────────────────────────────────────
+def _create_yf_session() -> requests.Session:
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0.0.0 Safari/537.36"
+        ),
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+        "Accept-Encoding": "gzip, deflate, br",
+        "Connection": "keep-alive",
+    })
+    try:
+        # Fetch Yahoo Finance homepage first to get session cookies
+        session.get("https://fc.yahoo.com", timeout=10)
+        session.get("https://finance.yahoo.com", timeout=10)
+        print("Yahoo Finance session initialised successfully.")
+    except Exception as e:
+        print(f"Warning: Could not initialise Yahoo Finance session: {e}")
+    return session
+
+# ─────────────────────────────────────────────
 # SETTINGS
 # ─────────────────────────────────────────────
 NUM_WEEKS          = 52
@@ -191,7 +219,7 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
     shares_outstanding = {}
     for i, ticker in enumerate(tickers, 1):
         try:
-            shares = getattr(yf.Ticker(ticker).fast_info, "shares", None)
+            shares = getattr(yf.Ticker(ticker, session=session).fast_info, "shares", None)
             if shares:
                 shares_outstanding[ticker] = shares
         except Exception:
@@ -200,6 +228,7 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
             print(f"  {i}/{len(tickers)} done...")
     print(f"  Shares outstanding fetched for {len(shares_outstanding)} tickers.\n")
 
+    session = _create_yf_session()
     raw = yf.download(
         tickers,
         start=overall_start,
@@ -209,6 +238,7 @@ def fetch_all_weeks(tickers: list, weeks: list) -> pd.DataFrame:
         auto_adjust=True,
         progress=True,
         threads=True,
+        session=session,
     )
 
     results = []
