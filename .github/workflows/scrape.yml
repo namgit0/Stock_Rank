@@ -1,0 +1,32 @@
+name: Scrape Nasdaq & NYSE Rankings
+
+on:
+  schedule:
+    - cron: "0 6,18 * * 1-5"   # 6am and 6pm UTC, weekdays only
+  workflow_dispatch:             # Manual trigger from GitHub UI
+
+jobs:
+  scrape:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run scraper
+        run: python Nasdaq_and_NYSE_Rank_Beta.py
+
+      - name: Commit and push updated CSV
+        run: |
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+          git add nasdaq_and_nyse_rank_*.csv
+          git commit -m "Auto-update data $(date +'%Y-%m-%d %H:%M')" && git push || echo "No changes to commit"
