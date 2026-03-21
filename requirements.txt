@@ -1,5 +1,6 @@
-yfinance
-pandas
-requests
-streamlit
-plotly
+yfinance==0.2.51
+pandas==2.2.3
+requests==2.32.3
+streamlit==1.40.2
+plotly==5.24.1
+altair==4.2.2
